@@ -30,32 +30,26 @@ import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecordBuilder;
 import org.apache.hadoop.fs.Path;
 import org.apache.iceberg.DataFile;
-import org.apache.iceberg.DataFiles;
-import org.apache.iceberg.Files;
 import org.apache.iceberg.HasTableOperations;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadataParser;
-import org.apache.iceberg.avro.Avro;
 import org.apache.iceberg.avro.AvroSchemaUtil;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.CommitFailedException;
-import org.apache.iceberg.io.FileAppender;
 import org.apache.iceberg.types.Types;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.projectnessie.api.params.CommitLogParams;
 import org.projectnessie.error.NessieConflictException;
 import org.projectnessie.error.NessieNotFoundException;
 import org.projectnessie.model.Branch;
 import org.projectnessie.model.CommitMeta;
 import org.projectnessie.model.ContentsKey;
 import org.projectnessie.model.IcebergTable;
-import org.projectnessie.model.ImmutableOperations;
-import org.projectnessie.model.ImmutablePut;
+import org.projectnessie.model.Operation;
 
 import static org.apache.iceberg.TableMetadataParser.getFileExtension;
 import static org.apache.iceberg.types.Types.NestedField.optional;
@@ -99,14 +93,91 @@ public class TestNessieTable extends BaseTestIceberg {
     super.afterEach();
   }
 
-  private org.projectnessie.model.IcebergTable getTable(ContentsKey key) throws NessieNotFoundException {
-    return client.getContentsApi()
-        .getContents(key, BRANCH, null)
-        .unwrap(IcebergTable.class).get();
+  private IcebergTable getTable(ContentsKey key)
+      throws NessieNotFoundException {
+    return getTable(BRANCH, key);
+  }
+
+  private IcebergTable getTable(String ref, ContentsKey key)
+      throws NessieNotFoundException {
+    return api.getContents().key(key).refName(ref).get().get(key).unwrap(IcebergTable.class).get();
+  }
+
+  /**
+   * Verify that Nessie always returns the globally-current global-contents w/ only DMLs.
+   */
+  @Test
+  public void verifyGlobalStateMovesForDML() throws Exception {
+    //  1. initialize table
+    Table icebergTable = catalog.loadTable(TABLE_IDENTIFIER);
+    icebergTable.updateSchema().addColumn("initial_column", Types.LongType.get()).commit();
+
+    //  2. create 2nd branch
+    String testCaseBranch = "verify-global-moving";
+    api.createReference().sourceRefName(BRANCH)
+        .reference(Branch.of(testCaseBranch, catalog.currentHash())).create();
+    NessieCatalog branchCatalog = initCatalog(testCaseBranch);
+
+    IcebergTable contentsInitialMain = getTable(BRANCH, KEY);
+    IcebergTable contentsInitialBranch = getTable(testCaseBranch, KEY);
+    Table tableInitialMain = catalog.loadTable(TABLE_IDENTIFIER);
+
+    // verify table-metadata-location + snapshot-id
+    Assertions.assertThat(contentsInitialMain)
+        .as("global-contents + snapshot-id equal on both branches in Nessie")
+        .isEqualTo(contentsInitialBranch);
+    Assertions.assertThat(tableInitialMain.currentSnapshot()).isNull();
+
+    //  3. modify table in "main" branch (add some data)
+
+    DataFile file1 = makeDataFile(icebergTable, addRecordsToFile(icebergTable, "file1"));
+    icebergTable.newAppend().appendFile(file1).commit();
+
+    IcebergTable contentsAfter1Main = getTable(KEY);
+    IcebergTable contentsAfter1Branch = getTable(testCaseBranch, KEY);
+    Table tableAfter1Main = catalog.loadTable(TABLE_IDENTIFIER);
+
+    //  --> assert getValue() against both branches returns the updated metadata-location
+    // verify table-metadata-location
+    Assertions.assertThat(contentsInitialMain.getMetadataLocation())
+        .describedAs("metadata-location must change on %s", BRANCH)
+        .isNotEqualTo(contentsAfter1Main.getMetadataLocation());
+    Assertions.assertThat(contentsInitialBranch.getMetadataLocation())
+        .describedAs("metadata-location must not change on %s", testCaseBranch)
+        .isEqualTo(contentsAfter1Branch.getMetadataLocation());
+    Assertions.assertThat(contentsAfter1Main.getIdGenerators())
+        .describedAs("global-contents equal on both branches")
+        .isEqualTo(contentsAfter1Branch.getIdGenerators());
+    // verify manifests
+    Assertions.assertThat(tableAfter1Main.currentSnapshot().allManifests())
+        .describedAs("verify number of manifests on 'main'")
+        .hasSize(1);
+
+    //  4. modify table in "main" branch (add some data) again
+
+    DataFile file2 = makeDataFile(icebergTable, addRecordsToFile(icebergTable, "file2"));
+    icebergTable.newAppend().appendFile(file2).commit();
+
+    IcebergTable contentsAfter2Main = getTable(KEY);
+    IcebergTable contentsAfter2Branch = getTable(testCaseBranch, KEY);
+    Table tableAfter2Main = catalog.loadTable(TABLE_IDENTIFIER);
+
+    //  --> assert getValue() against both branches returns the updated metadata-location
+    // verify table-metadata-location
+    Assertions.assertThat(contentsAfter2Main.getMetadataLocation())
+        .describedAs("metadata-location must change on %s", BRANCH)
+        .isNotEqualTo(contentsAfter1Main.getMetadataLocation());
+    Assertions.assertThat(contentsAfter2Branch.getMetadataLocation())
+        .describedAs("global-contents must not change on %s", testCaseBranch)
+        .isEqualTo(contentsAfter1Branch.getMetadataLocation());
+    // verify manifests
+    Assertions.assertThat(tableAfter2Main.currentSnapshot().allManifests())
+        .describedAs("verify number of manifests on 'main'")
+        .hasSize(2);
   }
 
   @Test
-  public void testCreate() throws NessieNotFoundException, IOException {
+  public void testCreate() throws IOException {
     // Table should be created in iceberg
     // Table should be renamed in iceberg
     String tableName = TABLE_IDENTIFIER.name();
@@ -152,7 +223,7 @@ public class TestNessieTable extends BaseTestIceberg {
 
   private void verifyCommitMetadata() throws NessieNotFoundException {
     // check that the author is properly set
-    List<CommitMeta> log = tree.getCommitLog(BRANCH, CommitLogParams.empty()).getOperations();
+    List<CommitMeta> log = api.getCommitLog().refName(BRANCH).get().getOperations();
     Assertions.assertThat(log).isNotNull().isNotEmpty();
     log.forEach(x -> {
       Assertions.assertThat(x.getAuthor()).isNotNull().isNotEmpty();
@@ -175,11 +246,7 @@ public class TestNessieTable extends BaseTestIceberg {
 
     String fileLocation = addRecordsToFile(table, "file");
 
-    DataFile file = DataFiles.builder(table.spec())
-        .withRecordCount(3)
-        .withPath(fileLocation)
-        .withFileSizeInBytes(Files.localInput(fileLocation).getLength())
-        .build();
+    DataFile file = makeDataFile(table, fileLocation);
 
     table.newAppend().appendFile(file).commit();
 
@@ -197,27 +264,11 @@ public class TestNessieTable extends BaseTestIceberg {
   public void testDropTable() throws IOException {
     Table table = catalog.loadTable(TABLE_IDENTIFIER);
 
-    GenericRecordBuilder recordBuilder =
-        new GenericRecordBuilder(AvroSchemaUtil.convert(schema, "test"));
-    List<GenericData.Record> records = new ArrayList<>();
-    records.add(recordBuilder.set("id", 1L).build());
-    records.add(recordBuilder.set("id", 2L).build());
-    records.add(recordBuilder.set("id", 3L).build());
-
     String location1 = addRecordsToFile(table, "file1");
     String location2 = addRecordsToFile(table, "file2");
 
-    DataFile file1 = DataFiles.builder(table.spec())
-        .withRecordCount(3)
-        .withPath(location1)
-        .withFileSizeInBytes(Files.localInput(location2).getLength())
-        .build();
-
-    DataFile file2 = DataFiles.builder(table.spec())
-        .withRecordCount(3)
-        .withPath(location2)
-        .withFileSizeInBytes(Files.localInput(location1).getLength())
-        .build();
+    DataFile file1 = makeDataFile(table, location1);
+    DataFile file2 = makeDataFile(table, location2);
 
     // add both data files
     table.newAppend().appendFile(file1).appendFile(file2).commit();
@@ -266,14 +317,15 @@ public class TestNessieTable extends BaseTestIceberg {
   @Test
   public void testFailure() throws NessieNotFoundException, NessieConflictException {
     Table icebergTable = catalog.loadTable(TABLE_IDENTIFIER);
-    Branch branch = (Branch) client.getTreeApi().getReferenceByName(BRANCH);
+    Branch branch = (Branch) api.getReference().refName(BRANCH).get();
 
-    IcebergTable table = client.getContentsApi().getContents(KEY, BRANCH, null).unwrap(IcebergTable.class).get();
+    IcebergTable table = getTable(BRANCH, KEY);
 
-    client.getTreeApi().commitMultipleOperations(branch.getName(), branch.getHash(),
-        ImmutableOperations.builder().addOperations(
-            ImmutablePut.builder().key(KEY).contents(IcebergTable.of("dummytable.metadata.json"))
-                .build()).commitMeta(CommitMeta.fromMessage("")).build());
+    IcebergTable value = IcebergTable.of("dummytable.metadata.json", "x", "cid");
+    api.commitMultipleOperations().branch(branch)
+        .operation(Operation.Put.of(KEY, value))
+        .commitMeta(CommitMeta.fromMessage(""))
+        .commit();
 
     Assertions.assertThatThrownBy(() -> icebergTable.updateSchema().addColumn("data", Types.LongType.get()).commit())
         .isInstanceOf(CommitFailedException.class)
@@ -341,16 +393,7 @@ public class TestNessieTable extends BaseTestIceberg {
     records.add(recordBuilder.set("id", 2L).build());
     records.add(recordBuilder.set("id", 3L).build());
 
-    String fileLocation = table.location().replace("file:", "") +
-        String.format("/data/%s.avro", filename);
-    try (FileAppender<GenericData.Record> writer = Avro.write(Files.localOutput(fileLocation))
-        .schema(schema)
-        .named("test")
-        .build()) {
-      for (GenericData.Record rec : records) {
-        writer.add(rec);
-      }
-    }
-    return fileLocation;
+    return writeRecordsToFile(table, schema, filename, records);
   }
+
 }

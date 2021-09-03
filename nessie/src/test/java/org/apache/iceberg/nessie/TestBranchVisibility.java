@@ -19,14 +19,32 @@
 
 package org.apache.iceberg.nessie;
 
+import java.util.Collections;
+import java.util.Map;
+import org.apache.avro.generic.GenericRecordBuilder;
+import org.apache.iceberg.DataFile;
+import org.apache.iceberg.Table;
+import org.apache.iceberg.TableIdGeneratorsParser;
+import org.apache.iceberg.avro.AvroSchemaUtil;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
-import org.assertj.core.api.Assertions;
+import org.apache.iceberg.types.Types.NestedField;
+import org.assertj.core.api.AbstractStringAssert;
+import org.assertj.core.api.InstanceOfAssertFactories;
+import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.projectnessie.error.NessieConflictException;
 import org.projectnessie.error.NessieNotFoundException;
+import org.projectnessie.model.Branch;
+import org.projectnessie.model.ContentsKey;
+import org.projectnessie.model.IcebergTable;
+import org.projectnessie.model.Reference;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 public class TestBranchVisibility extends BaseTestIceberg {
 
@@ -53,29 +71,27 @@ public class TestBranchVisibility extends BaseTestIceberg {
     catalog.dropTable(tableIdentifier1);
     catalog.dropTable(tableIdentifier2);
     catalog.refresh();
-    catalog.getTreeApi().deleteBranch("test", catalog.getTreeApi().getReferenceByName("test").getHash());
+    for (Reference reference : api.getAllReferences().get()) {
+      if (!reference.getName().equals("main")) {
+        api.deleteBranch().branch((Branch) reference).delete();
+      }
+    }
     testCatalog = null;
   }
 
   @Test
   public void testBranchNoChange() {
-    testCatalogEquality(catalog, testCatalog, true, true);
+    testCatalogEquality(catalog, testCatalog, true, true, () -> { });
   }
 
+  /** Ensure catalogs can't see each others updates. */
   @Test
   public void testUpdateCatalogs() {
-    // ensure catalogs can't see each others updates
-    updateSchema(catalog, tableIdentifier1);
+    testCatalogEquality(catalog, testCatalog, false, true,
+        () -> updateSchema(catalog, tableIdentifier1));
 
-    testCatalogEquality(catalog, testCatalog, false, true);
-
-    String initialMetadataLocation = metadataLocation(testCatalog, tableIdentifier2);
-    updateSchema(testCatalog, tableIdentifier2);
-
-    testCatalogEquality(catalog, testCatalog, false, false);
-
-    // points to the previous metadata location
-    Assertions.assertThat(initialMetadataLocation).isEqualTo(metadataLocation(catalog, tableIdentifier2));
+    testCatalogEquality(catalog, testCatalog, false, false,
+        () -> updateSchema(catalog, tableIdentifier2));
   }
 
   @Test
@@ -85,11 +101,11 @@ public class TestBranchVisibility extends BaseTestIceberg {
 
     // catalog created with ref points to same catalog as above
     NessieCatalog refCatalog = initCatalog("test");
-    testCatalogEquality(refCatalog, testCatalog, true, true);
+    testCatalogEquality(refCatalog, testCatalog, true, true, () -> { });
 
     // catalog created with hash points to same catalog as above
     NessieCatalog refHashCatalog = initCatalog("main");
-    testCatalogEquality(refHashCatalog, catalog, true, true);
+    testCatalogEquality(refHashCatalog, catalog, true, true, () -> { });
   }
 
   @Test
@@ -99,14 +115,14 @@ public class TestBranchVisibility extends BaseTestIceberg {
     String mainName = "main";
 
     // asking for table@branch gives expected regardless of catalog
-    Assertions.assertThat(metadataLocation(catalog, TableIdentifier.of("test-ns", "table1@test")))
+    assertThat(metadataLocation(catalog, TableIdentifier.of("test-ns", "table1@test")))
         .isEqualTo(metadataLocation(testCatalog, tableIdentifier1));
 
     // Asking for table@branch gives expected regardless of catalog.
     // Earlier versions used "table1@" + tree.getReferenceByName("main").getHash() before, but since
     // Nessie 0.8.2 the branch name became mandatory and specifying a hash within a branch is not
     // possible.
-    Assertions.assertThat(metadataLocation(catalog, TableIdentifier.of("test-ns", "table1@" + mainName)))
+    assertThat(metadataLocation(catalog, TableIdentifier.of("test-ns", "table1@" + mainName)))
         .isEqualTo(metadataLocation(testCatalog, tableIdentifier1));
   }
 
@@ -118,35 +134,178 @@ public class TestBranchVisibility extends BaseTestIceberg {
     updateSchema(emptyTestCatalog, tableIdentifier1);
   }
 
+  /**
+   * Complex-ish test case that verifies that both the snapshot-ID and schema-ID are properly set
+   * and retained when working with a mixture of DDLs and DMLs across multiple branches.
+   */
+  @Test
+  public void testStateTrackingOnMultipleBranches() throws Exception {
+
+    NessieCatalog catalog = initCatalog("test");
+    verifySchema(catalog, tableIdentifier1, Types.LongType.get());
+    String initialLocation = metadataLocation(catalog, tableIdentifier1);
+
+    int expectedLastColumnId = 1;
+
+    // Verify last-column-id
+    verifyRefState(catalog, tableIdentifier1, expectedLastColumnId);
+
+    // Add a row and verify that the
+    String metadataOnTest = addRow(catalog, tableIdentifier1, "initial-data",
+        Collections.singletonMap("id0", 1L));
+    assertThat(metadataOnTest).isNotEqualTo(initialLocation);
+    verifyRefState(catalog, tableIdentifier1, expectedLastColumnId);
+
+    String branchA = "branch_a";
+    String branchB = "branch_b";
+
+    String hash = api.getReference().refName("test").get().getHash();
+    api.createReference().reference(Branch.of(branchA, hash)).sourceRefName("test").create();
+    api.createReference().reference(Branch.of(branchB, hash)).sourceRefName("test").create();
+
+    NessieCatalog catalogBranchA = initCatalog(branchA);
+    // branchA hasn't been modified yet, so it must be "equal" to branch "test"
+    verifyRefState(catalogBranchA, tableIdentifier1, expectedLastColumnId);
+    updateSchema(catalogBranchA, tableIdentifier1, Types.StringType.get());
+    expectedLastColumnId++;
+    // updateSchema() must update the lastColumnId (global state) on all references
+    verifyRefState(catalogBranchA, tableIdentifier1, expectedLastColumnId);
+    verifySchema(catalogBranchA, tableIdentifier1, Types.LongType.get(), Types.StringType.get());
+    verifyRefState(catalog, tableIdentifier1, expectedLastColumnId);
+
+    String metadataOnA1 = addRow(catalogBranchA, tableIdentifier1, "branch-a-1",
+        ImmutableMap.of("id0", 2L, "id1", "hello"));
+    // addRow() must produce a new metadata
+    assertThat(metadataOnA1)
+        .isNotEqualTo(metadataOnTest);
+    verifyRefState(catalogBranchA, tableIdentifier1, expectedLastColumnId);
+    verifyRefState(catalog, tableIdentifier1, expectedLastColumnId);
+
+    NessieCatalog catalogBranchB = initCatalog(branchB);
+    // branchB hasn't been modified yet, so it must be "equal" to branch "test"
+    verifyRefState(catalogBranchB, tableIdentifier1, expectedLastColumnId);
+    updateSchema(catalogBranchB, tableIdentifier1, Types.LongType.get());
+    expectedLastColumnId++;
+    // updateSchema() must update the lastColumnId (global state) on all references
+    verifyRefState(catalogBranchB, tableIdentifier1, expectedLastColumnId);
+    verifySchema(catalogBranchB, tableIdentifier1, Types.LongType.get(), Types.LongType.get());
+    verifyRefState(catalog, tableIdentifier1, expectedLastColumnId);
+
+    String metadataOnB1 = addRow(catalogBranchB, tableIdentifier1, "branch-b-1",
+        ImmutableMap.of("id0", 3L, "id2", 42L));
+    // addRow() must produce a new metadata
+    assertThat(metadataOnB1)
+        .isNotEqualTo(metadataOnA1)
+        .isNotEqualTo(metadataOnTest);
+    verifyRefState(catalogBranchB, tableIdentifier1, expectedLastColumnId);
+    verifyRefState(catalog, tableIdentifier1, expectedLastColumnId);
+
+    // repeat addRow() against branchA
+    catalogBranchA = initCatalog(branchA);
+    verifySchema(catalogBranchA, tableIdentifier1, Types.LongType.get(), Types.StringType.get());
+    String metadataOnA2 = addRow(catalogBranchA, tableIdentifier1, "branch-a-2",
+        ImmutableMap.of("id0", 4L, "id1", "hello"));
+    assertThat(metadataOnA2)
+        .isNotEqualTo(metadataOnA1)
+        .isNotEqualTo(metadataOnB1)
+        .isNotEqualTo(metadataOnTest);
+    verifyRefState(catalogBranchA, tableIdentifier1, expectedLastColumnId);
+
+    // repeat addRow() against branchB
+    catalogBranchB = initCatalog(branchB);
+    verifySchema(catalogBranchB, tableIdentifier1, Types.LongType.get(), Types.LongType.get());
+    String metadataOnB2 = addRow(catalogBranchB, tableIdentifier1, "branch-b-2",
+        ImmutableMap.of("id0", 5L, "id2", 666L));
+    assertThat(metadataOnB2)
+        .isNotEqualTo(metadataOnA1).isNotEqualTo(metadataOnA2)
+        .isNotEqualTo(metadataOnB1)
+        .isNotEqualTo(metadataOnTest);
+    verifyRefState(catalogBranchB, tableIdentifier1, expectedLastColumnId);
+
+    // sanity check, branch "test" must not have changed
+    verifyRefState(catalog, tableIdentifier1, expectedLastColumnId);
+  }
+
+  private void verifyRefState(NessieCatalog catalog, TableIdentifier identifier, int lastColumnId) throws Exception {
+    ContentsKey key = NessieUtil.toKey(identifier);
+    IcebergTable icebergTable = api.getContents().refName(catalog.currentRefName()).key(key)
+        .get().get(key).unwrap(IcebergTable.class).get();
+    assertThat(icebergTable)
+        .extracting(t -> TableIdGeneratorsParser.parseJson(t.getIdGenerators()).lastColumnId())
+        .isEqualTo(lastColumnId);
+  }
+
+  private String addRow(NessieCatalog catalog, TableIdentifier identifier, String fileName, Map<String, Object> data)
+      throws Exception {
+    Table table = catalog.loadTable(identifier);
+    GenericRecordBuilder recordBuilder =
+        new GenericRecordBuilder(AvroSchemaUtil.convert(table.schema(), table.name()));
+    data.forEach(recordBuilder::set);
+
+    String fileLocation = writeRecordsToFile(table, table.schema(), fileName,
+        Collections.singletonList(recordBuilder.build()));
+    DataFile dataFile = makeDataFile(table, fileLocation);
+    table.newAppend().appendFile(dataFile).commit();
+
+    return metadataLocation(catalog, identifier);
+  }
+
+  private void verifySchema(NessieCatalog catalog, TableIdentifier identifier, Type... types) {
+    assertThat(catalog.loadTable(identifier))
+        .extracting(t -> t.schema().columns().stream().map(NestedField::type))
+        .asInstanceOf(InstanceOfAssertFactories.stream(Type.class))
+        .containsExactly(types);
+  }
+
   private void updateSchema(NessieCatalog catalog, TableIdentifier identifier) {
-    catalog.loadTable(identifier).updateSchema().addColumn("id" + schemaCounter++, Types.LongType.get()).commit();
+    updateSchema(catalog, identifier, Types.LongType.get());
+  }
+
+  private void updateSchema(NessieCatalog catalog, TableIdentifier identifier, Type type) {
+    catalog.loadTable(identifier).updateSchema().addColumn("id" + schemaCounter++, type).commit();
   }
 
   private void testCatalogEquality(
-      NessieCatalog catalog, NessieCatalog compareCatalog, boolean table1Equal, boolean table2Equal) {
+      NessieCatalog catalog, NessieCatalog compareCatalog, boolean table1Equal, boolean table2Equal,
+      ThrowingCallable callable) {
     String testTable1 = metadataLocation(compareCatalog, tableIdentifier1);
-    String table1 = metadataLocation(catalog, tableIdentifier1);
     String testTable2 = metadataLocation(compareCatalog, tableIdentifier2);
+
+    try {
+      callable.call();
+    } catch (RuntimeException e) {
+      throw e;
+    } catch (Throwable e) {
+      throw new RuntimeException(e);
+    }
+
+    String table1 = metadataLocation(catalog, tableIdentifier1);
     String table2 = metadataLocation(catalog, tableIdentifier2);
 
-    Assertions.assertThat(table1.equals(testTable1))
-        .withFailMessage(() -> String.format(
-            "Table %s on ref %s should%s equal table %s on ref %s",
+    AbstractStringAssert<?> assertion = assertThat(table1)
+        .describedAs("Table %s on ref %s should%s be equal to table %s on ref %s",
             tableIdentifier1.name(),
-            tableIdentifier2.name(),
-            table1Equal ? "" : " not",
             catalog.currentRefName(),
-            testCatalog.currentRefName()))
-        .isEqualTo(table1Equal);
+            table1Equal ? "" : " not",
+            tableIdentifier1.name(),
+            compareCatalog.currentRefName());
+    if (table1Equal) {
+      assertion.isEqualTo(testTable1);
+    } else  {
+      assertion.isNotEqualTo(testTable1);
+    }
 
-    Assertions.assertThat(table2.equals(testTable2))
-        .withFailMessage(() -> String.format(
-            "Table %s on ref %s should%s equal table %s on ref %s",
-            tableIdentifier1.name(),
+    assertion = assertThat(table2)
+        .describedAs("Table %s on ref %s should%s be equal to table %s on ref %s",
             tableIdentifier2.name(),
-            table1Equal ? "" : " not",
             catalog.currentRefName(),
-            testCatalog.currentRefName()))
-        .isEqualTo(table2Equal);
+            table2Equal ? "" : " not",
+            tableIdentifier2.name(),
+            compareCatalog.currentRefName());
+    if (table2Equal) {
+      assertion.isEqualTo(testTable2);
+    } else  {
+      assertion.isNotEqualTo(testTable2);
+    }
   }
 }

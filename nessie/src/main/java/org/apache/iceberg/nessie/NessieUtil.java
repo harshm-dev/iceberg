@@ -34,6 +34,7 @@ import org.projectnessie.model.CommitMeta;
 import org.projectnessie.model.ContentsKey;
 import org.projectnessie.model.EntriesResponse;
 import org.projectnessie.model.ImmutableCommitMeta;
+import org.projectnessie.model.ImmutableCommitMeta.Builder;
 
 public final class NessieUtil {
 
@@ -92,15 +93,18 @@ public final class NessieUtil {
   }
 
   static CommitMeta buildCommitMetadata(String commitMsg, Map<String, String> catalogOptions) {
-    Preconditions.checkArgument(null != catalogOptions, "catalogOptions must not be null");
-    ImmutableCommitMeta.Builder cm = CommitMeta.builder().message(commitMsg)
-        .author(NessieUtil.commitAuthor(catalogOptions));
-    cm.putProperties(APPLICATION_TYPE, "iceberg");
-    if (catalogOptions.containsKey(CatalogProperties.APP_ID)) {
-      cm.putProperties(CatalogProperties.APP_ID, catalogOptions.get(CatalogProperties.APP_ID));
-    }
+    return catalogOptions(CommitMeta.builder().message(commitMsg), catalogOptions).build();
+  }
 
-    return cm.build();
+  static ImmutableCommitMeta.Builder catalogOptions(Builder commitMetaBuilder,
+      Map<String, String> catalogOptions) {
+    Preconditions.checkArgument(null != catalogOptions, "catalogOptions must not be null");
+    commitMetaBuilder.author(NessieUtil.commitAuthor(catalogOptions));
+    commitMetaBuilder.putProperties(APPLICATION_TYPE, "iceberg");
+    if (catalogOptions.containsKey(CatalogProperties.APP_ID)) {
+      commitMetaBuilder.putProperties(CatalogProperties.APP_ID, catalogOptions.get(CatalogProperties.APP_ID));
+    }
+    return commitMetaBuilder;
   }
 
   /**

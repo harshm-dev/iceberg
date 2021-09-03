@@ -1003,4 +1003,16 @@ public class TableMetadata implements Serializable {
     }
     return newSchemaId;
   }
+
+  public TableIdGenerators getIdGenerators() {
+    return TableIdGenerators.of(formatVersion, lastColumnId, lastAssignedPartitionId, lastSequenceNumber);
+  }
+
+  public TableMetadata withIdGenerators(TableIdGenerators idGenerators) {
+    return new TableMetadata(file, formatVersion, uuid, location,
+        idGenerators.lastSequenceNumber(), System.currentTimeMillis(), idGenerators.lastColumnId(),
+        currentSchemaId, schemas, defaultSpecId, specs, idGenerators.lastAssignedPartitionId(),
+        defaultSortOrderId, sortOrders, properties, currentSnapshotId, snapshots, snapshotLog,
+        addPreviousFile(file, lastUpdatedMillis));
+  }
 }
